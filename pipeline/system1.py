@@ -126,12 +126,40 @@ async def run(
     ui.tools_list(tools)
 
     for rnd in range(max_rounds):
+        # ══════════════════════════════════════════════════════════════════════
+        # INPUT  →  what we are sending to the LLM this round
+        # ══════════════════════════════════════════════════════════════════════
+        total_chars = sum(len(str(m.get("content") or "")) for m in conversation)
+        ui.console.rule(
+            f"[bold yellow]▶  Round {rnd+1}  —  sending {len(conversation)} messages"
+            f"  ≈{total_chars//4:,} tok[/bold yellow]",
+            style="yellow dim",
+        )
+        colors = {"system": "magenta", "user": "green", "assistant": "blue", "tool": "cyan"}
+        for m in conversation:
+            role    = m.get("role", "?")
+            content = str(m.get("content") or "")
+            # tool_calls inside assistant messages
+            if not content and m.get("tool_calls"):
+                content = "[tool_calls: " + ", ".join(
+                    tc["function"]["name"] for tc in m["tool_calls"]
+                ) + "]"
+            preview = content[:500].replace("\n", " ↵ ")
+            if len(content) > 500:
+                preview += f"  [dim]…+{len(content)-500} chars[/dim]"
+            c = colors.get(role, "white")
+            ui.console.print(f"  [bold {c}][{role:9}][/bold {c}]  {preview}")
+
+        # ══════════════════════════════════════════════════════════════════════
+        # LLM CALL
+        # ══════════════════════════════════════════════════════════════════════
         t_llm = time.perf_counter()
         if stream_callback:
             msg, usage = await _llm_call_stream(model, conversation, tools, stream_callback)
         else:
             msg, usage = await _llm_call(model, conversation, tools)
-        ui.timing(f"LLM round {rnd+1}", time.perf_counter() - t_llm)
+        elapsed_llm = time.perf_counter() - t_llm
+        ui.timing(f"LLM round {rnd+1}", elapsed_llm)
         if usage:
             ui.token_usage(f"round {rnd+1}", usage.prompt_tokens, usage.completion_tokens)
 
@@ -139,24 +167,57 @@ async def run(
         if reasoning:
             ui.reasoning_block(reasoning, f"Round {rnd+1} Reasoning")
 
+        # ══════════════════════════════════════════════════════════════════════
+        # OUTPUT  ←  what the LLM sent back
+        # ══════════════════════════════════════════════════════════════════════
+        raw_text = msg.get("content") or ""
+        tool_calls = msg.get("tool_calls") or []
+
+        if raw_text:
+            preview = raw_text[:800]
+            suffix  = f"\n[dim]…+{len(raw_text)-800} chars[/dim]" if len(raw_text) > 800 else ""
+            from rich.panel import Panel
+            from rich.text import Text
+            ui.console.print(Panel(
+                Text(preview + suffix, style="white"),
+                title=f"[bold cyan]← LLM RESPONSE  (round {rnd+1})[/bold cyan]",
+                border_style="cyan",
+                padding=(0, 2),
+            ))
+
+        if tool_calls:
+            names = [tc["function"]["name"] for tc in tool_calls]
+            ui.console.print(
+                f"  [bold magenta]← LLM wants to call {len(tool_calls)} tool(s):"
+                f"  {', '.join(names)}[/bold magenta]"
+            )
+
         conversation.append(msg)
         appended.append(msg)
 
-        if not msg.get("tool_calls"):
-            ui.no_tools_used()
+        if not tool_calls:
+            ui.console.rule("[dim]no tool calls — final answer[/dim]", style="dim")
             ui.ok(f"Response generated (round {rnd+1})")
-            return msg.get("content") or "", appended
+            return raw_text, appended
 
-        # Execute tool calls
-        ui.stage(f"Round {rnd+1} — tool calls: {len(msg['tool_calls'])}")
-        for tc in msg["tool_calls"]:
+        # ══════════════════════════════════════════════════════════════════════
+        # TOOL EXECUTION
+        # ══════════════════════════════════════════════════════════════════════
+        for i, tc in enumerate(tool_calls, 1):
             name = tc["function"]["name"]
             try:
                 args = json.loads(tc["function"]["arguments"])
             except json.JSONDecodeError:
                 args = {}
 
-            ui.tool_call(name, json.dumps(args, ensure_ascii=False))
+            ui.console.rule(
+                f"[bold magenta]🔧  TOOL CALL {i}/{len(tool_calls)}  →  {name}[/bold magenta]",
+                style="magenta dim",
+            )
+            ui.console.print(
+                f"  [bold yellow]args:[/bold yellow]  "
+                f"[yellow]{json.dumps(args, ensure_ascii=False, indent=2)}[/yellow]"
+            )
 
             t_tool = time.perf_counter()
             try:
@@ -167,8 +228,18 @@ async def run(
                 )
             except Exception as e:
                 content = f"Tool error: {e}"
-            ui.timing(name, time.perf_counter() - t_tool)
+            elapsed_tool = time.perf_counter() - t_tool
 
+            ui.console.rule(
+                f"[bold cyan]📥  TOOL RESULT  ←  {name}  ⏱ {elapsed_tool*1000:.0f} ms[/bold cyan]",
+                style="cyan dim",
+            )
+            preview = content[:1000]
+            suffix  = f"\n[dim]…+{len(content)-1000} chars[/dim]" if len(content) > 1000 else ""
+            ui.console.print(f"  [dim]{preview}{suffix}[/dim]")
+
+            # Also fire the existing ui hooks so the web UI collector still works
+            ui.tool_call(name, json.dumps(args, ensure_ascii=False))
             ui.tool_result(content)
 
             tool_msg = {

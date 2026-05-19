@@ -89,7 +89,7 @@ class ChatRequest(BaseModel):
     user_id: str
     message: str
     session_id: str | None = None
-    deepthink: bool = True
+    deepthink: bool = False
 
 
 @app.post("/api/chat/stream")

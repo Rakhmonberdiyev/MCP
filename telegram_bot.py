@@ -97,13 +97,12 @@ class _TelegramStreamer:
         return self._buf
 
 
-# ── Per-user settings (in-memory) ─────────────────────────────────────────────
-# {telegram_user_id: {"deepthink": bool}}
+
 _settings: dict[int, dict] = {}
 
 
 def _get_deepthink(uid: int) -> bool:
-    return _settings.setdefault(uid, {"deepthink": True})["deepthink"]
+    return _settings.setdefault(uid, {"deepthink": False})["deepthink"]
 
 
 def _set_deepthink(uid: int, val: bool) -> None:

@@ -36,8 +36,13 @@ import config
 from fastmcp import FastMCP
 
 import ui
-from memory.session import get_session, save_turn, get_user_docs
-from memory.ltm import search_ltm, upsert_ltm
+from memory.session import (
+    get_active_buffer, get_older_history,
+    get_session_summary, save_session_summary,
+    get_current_session_meta,
+    save_turn, get_user_docs,
+)
+from memory.ltm import search_ltm, upsert_ltm, query_ltm_limit, deduplicate_ltm_facts
 from tools.mcp_server import search_mcp, rag_mcp
 from tools.remote_mcp import (
     deposit_mcp, credit_mcp, pension_mcp,
@@ -135,20 +140,27 @@ async def process_turn(
         _times[label] = time.perf_counter() - t
         return result
 
-    session_hist, ltm_facts, user_docs = await asyncio.gather(
-        _timed(get_session(user_id),              "Redis session"),
-        _timed(search_ltm(user_input, user_id),   "Mem0 LTM search"),
-        _timed(get_user_docs(user_id),            "User docs (Redis)"),
+    ltm_limit = query_ltm_limit(user_input, deepthink=deepthink)
+
+    active_buffer, session_summary, ltm_facts, user_docs = await asyncio.gather(
+        _timed(get_active_buffer(user_id),                        "Redis active buffer"),
+        _timed(get_session_summary(user_id),                      "Redis session summary"),
+        _timed(search_ltm(user_input, user_id, limit=ltm_limit),  "Mem0 LTM search"),
+        _timed(get_user_docs(user_id),                            "User docs (Redis)"),
     )
 
     for label, elapsed in _times.items():
         ui.timing(label, elapsed)
 
-    n_turns = len(session_hist) // 2
-    ui.kv("Redis session",  f"{n_turns} turn{'s' if n_turns != 1 else ''}" if n_turns else "empty (new session)")
-    ui.session_dump(session_hist[-6:])
+    n_turns = len(active_buffer) // 2
+    ui.kv("Active buffer",   f"{n_turns} turn{'s' if n_turns != 1 else ''} (last 5)")
+    ui.kv("Session summary", f"{len(session_summary)} chars" if session_summary else "none yet")
+    ui.session_dump(active_buffer[-6:])
 
-    ui.kv("Mem0 LTM facts", f"{len(ltm_facts.splitlines())} facts" if ltm_facts else "none found")
+    # Deduplicate: remove LTM facts already visible in the active buffer
+    ltm_facts = deduplicate_ltm_facts(ltm_facts, active_buffer)
+
+    ui.kv("Mem0 LTM facts", f"{len(ltm_facts.splitlines())} facts (limit={ltm_limit})" if ltm_facts else f"none (limit={ltm_limit})")
     ui.ltm_dump(ltm_facts)
 
     if metadata is not None:
@@ -156,22 +168,28 @@ async def process_turn(
 
     ui.kv("Uploaded docs",  ", ".join(user_docs) if user_docs else "none")
 
-    messages = build_messages(user_input, session_hist, ltm_facts, user_docs=user_docs)
+    messages = build_messages(
+        user_input, active_buffer, ltm_facts,
+        session_summary=session_summary,
+        user_docs=user_docs,
+    )
     ui.kv("Context window", f"{len(messages)} messages sent to LLM")
 
     # ── Token source breakdown (approximate: chars ÷ 4) ────────────────────────
     def _est(text: str) -> int:
         return max(0, len(text) // 4)
 
-    sys_total_toks = _est(messages[0]["content"])
-    ltm_toks       = _est(ltm_facts) if ltm_facts else 0
-    session_toks   = sum(_est(str(m.get("content", ""))) for m in session_hist)
-    user_toks      = _est(user_input)
+    sys_total_toks   = _est(messages[0]["content"])
+    ltm_toks         = _est(ltm_facts) if ltm_facts else 0
+    summary_toks     = _est(session_summary) if session_summary else 0
+    buffer_toks      = sum(_est(str(m.get("content", ""))) for m in active_buffer)
+    user_toks        = _est(user_input)
     ui.token_sources({
-        "System prompt":  max(0, sys_total_toks - ltm_toks),
-        "Redis session":  session_toks,
-        "Mem0 LTM":       ltm_toks,
-        "User input":     user_toks,
+        "System prompt":    max(0, sys_total_toks - ltm_toks - summary_toks),
+        "Session summary":  summary_toks,
+        "Active buffer":    buffer_toks,
+        "Mem0 LTM":         ltm_toks,
+        "User input":       user_toks,
     })
 
     ui.section("Messages → LLM")
@@ -230,7 +248,7 @@ async def process_turn(
     ui.save_redis(user_input, response)
     ui.stage("Saving to Mem0 (LTM upsert)")
     ui.save_mem0(user_input, response)
-    asyncio.create_task(_persist(user_input, response, user_id))
+    asyncio.create_task(_persist(user_input, response, user_id, model))
 
     ui.blank()
     ui.response_panel(response)
@@ -240,7 +258,42 @@ async def process_turn(
     return response
 
 
-async def _persist(user_input: str, response: str, user_id: str) -> None:
+async def _generate_summary(user_id: str, model: str) -> None:
+    """Summarize older turns and save to Redis. Runs in background every 5 turns."""
+    older = await get_older_history(user_id)
+    if not older:
+        return
+    # Format older history as plain text, truncating long assistant replies
+    lines: list[str] = []
+    for m in older:
+        role    = "User" if m["role"] == "user" else "Assistant"
+        content = (m.get("content") or "")[:300]
+        lines.append(f"{role}: {content}")
+    text = "\n".join(lines)
+    try:
+        resp = await config.llm_client.chat.completions.create(
+            model=model,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "Summarize this conversation excerpt in 2–3 concise sentences. "
+                        "Focus on what the user asked and what the assistant found or answered. "
+                        "Be factual. No filler phrases."
+                    ),
+                },
+                {"role": "user", "content": text},
+            ],
+        )
+        summary = (resp.choices[0].message.content or "").strip()
+        if summary:
+            await save_session_summary(user_id, summary)
+            ui.console.print(f"[dim]  📝 Session summary updated ({len(summary)} chars)[/dim]")
+    except Exception as e:
+        ui.warn(f"Summary generation failed (non-fatal): {e}")
+
+
+async def _persist(user_input: str, response: str, user_id: str, model: str) -> None:
     try:
         await asyncio.gather(
             save_turn(user_id, user_input, response),
@@ -249,6 +302,16 @@ async def _persist(user_input: str, response: str, user_id: str) -> None:
         ui.console.print("[dim]  💾 Redis ✓  Mem0 ✓[/dim]")
     except Exception as e:
         ui.warn(f"Persist error: {e}")
+        return
+
+    # Regenerate session summary every 5 turns once we have older history
+    try:
+        meta = await get_current_session_meta(user_id)
+        turn_count = (meta or {}).get("message_count", 0)
+        if turn_count >= 5 and turn_count % 5 == 0:
+            await _generate_summary(user_id, model)
+    except Exception as e:
+        ui.warn(f"Summary trigger failed (non-fatal): {e}")
 
 
 # ── CLI loop ───────────────────────────────────────────────────────────────────
@@ -265,7 +328,7 @@ async def main() -> None:
     await initialize()
 
     USER_ID   = "user_001"
-    deepthink = True
+    deepthink = False
 
     while True:
         try:

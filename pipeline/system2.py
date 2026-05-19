@@ -55,7 +55,7 @@ Rules:
 - Only set verdict "needs_data" if you CANNOT answer without external lookup.
 - For greetings, math, general knowledge → verdict "validated".
 - For current events, bank/financial data, schedules, specific facts → verdict "needs_data".
-- Prefer specific domain tools (Deposit, Credit, Pension, Card, Admin, RealTime) over web_search when the question is about bank products or services.
+- Prefer specific domain tools (Deposit, Credit, Pension, Card, Admin, RealTime) over WebSearch_web_search when the question is about bank products or services.
 
 Available tools:
 {tools_list}
@@ -70,9 +70,7 @@ Return ONLY valid JSON (no markdown fences):
   "confidence": <integer 0-10>,
   "verdict": "validated" or "needs_data",
   "missing": "<what is still needed, or empty string>",
-  "tool": "<exact tool name from the list above>",
-  "tool_args": {{<argument key-value pairs matching the tool's parameters, or {{"query": "..."}} for web/rag search>}},
-  "search_query": "<for web_search/rag_search only, the search query string>"
+  "tool": "<exact tool name from the list above, or empty string if validated>"
 }}"""
 
 _SYNTHESIS_SYSTEM = """\
@@ -150,6 +148,43 @@ def _build_tools_list(schemas: list[dict]) -> str:
         params = ", ".join(props.keys()) if props else "no params"
         lines.append(f"  - {fn['name']}: {fn['description']} (args: {params})")
     return "\n".join(lines)
+
+
+async def _proactive_tool_call(
+    mcp: FastMCP,
+    tool_schema: dict,
+    missing: str,
+    goal: str,
+    model: str,
+) -> tuple[str, dict]:
+    """Use the real OpenAI tools API to call one specific tool with correct args.
+
+    Forces the LLM to call exactly the chosen tool so args are always well-formed.
+    Returns (result_text, args_used).
+    """
+    tool_name = tool_schema["function"]["name"]
+    try:
+        resp = await llm_client.chat.completions.create(
+            model=model,
+            messages=[{"role": "user", "content":
+                f"Goal: {goal}\nMissing information: {missing}\n"
+                f"Call the tool '{tool_name}' with the correct arguments to retrieve this data."
+            }],
+            tools=[tool_schema],
+            tool_choice={"type": "function", "function": {"name": tool_name}},
+        )
+        msg = resp.choices[0].message.model_dump()
+        if msg.get("tool_calls"):
+            tc = msg["tool_calls"][0]
+            try:
+                args = json.loads(tc["function"]["arguments"])
+            except json.JSONDecodeError:
+                args = {}
+            result = await _call_tool(mcp, tool_name, args)
+            return result, args
+        return "Tool call not executed by LLM.", {}
+    except Exception as e:
+        return f"Tool call error: {e}", {}
 
 
 async def _get_tool_schemas(mcp: FastMCP) -> list[dict]:
@@ -397,45 +432,51 @@ async def run(
             if crit_reasoning:
                 ui.reasoning_block(crit_reasoning, f"Critique Round {rnd+1}")
 
-            crit         = _parse_json(crit_content)
-            verdict      = crit.get("verdict", "validated")
-            crit_conf    = int(crit.get("confidence", 7))
-            search_query = crit.get("search_query", "").strip()
-            mcp_tool     = crit.get("tool", "WebSearch_web_search").strip()
-            tool_args    = crit.get("tool_args") or {}
+            crit      = _parse_json(crit_content)
+            verdict   = crit.get("verdict", "validated")
+            crit_conf = int(crit.get("confidence", 7))
+            missing   = crit.get("missing", "").strip()
+            mcp_tool  = (crit.get("tool") or "").strip()
 
             ui.kv("Verdict",    verdict)
             ui.kv("Confidence", f"{crit_conf}/10")
-            ui.kv("Missing",    crit.get("missing", "") or "—")
-            ui.kv("Tool",       mcp_tool)
+            ui.kv("Missing",    missing or "—")
+            ui.kv("Tool",       mcp_tool or "—")
 
             reasoning_trace.append(
                 f"Critique round {rnd+1}: verdict={verdict} confidence={crit_conf}"
             )
 
-            # If no data needed → validate and exit loop
+            # If validated or no tool chosen → exit loop
             if verdict != "needs_data" or not mcp_tool:
                 if crit_conf >= 7 or verdict == "validated":
                     ui.ok("Plan validated — moving to Final Synthesis")
                     break
 
-            # ── Proactive Tool Call (MCP Sandbox) ──────────────────────────────
-            # Use tool_args if provided by LLM; fall back to {"query": search_query}
-            if not tool_args and search_query:
-                tool_args = {"query": search_query}
+            # ── Proactive Tool Call — use real OpenAI tools API for correct args ─
+            tool_schema = next(
+                (s for s in all_tool_schemas if s["function"]["name"] == mcp_tool), None
+            )
+            if tool_schema is None:
+                ui.warn(f"Tool '{mcp_tool}' not found — falling back to web search")
+                mcp_tool    = "WebSearch_web_search"
+                tool_schema = next(
+                    (s for s in all_tool_schemas if s["function"]["name"] == mcp_tool), None
+                )
 
-            if tool_args:
+            if tool_schema:
                 ui.stage("Proactive Tool Call → MCP Sandbox")
-                ui.kv("Tool",  mcp_tool)
-                ui.kv("Args",  json.dumps(tool_args, ensure_ascii=False)[:200])
-                ui.tool_call(mcp_tool, json.dumps(tool_args, ensure_ascii=False))
+                ui.kv("Tool", mcp_tool)
 
                 t_tool = time.perf_counter()
-                result = await _call_tool(mcp, mcp_tool, tool_args)
+                result, args_used = await _proactive_tool_call(
+                    mcp, tool_schema, missing, goal, model
+                )
                 ui.timing(mcp_tool, time.perf_counter() - t_tool)
+                ui.tool_call(mcp_tool, json.dumps(args_used, ensure_ascii=False))
                 ui.tool_result(result)
 
-                evidence_pieces.append(f"[{mcp_tool} | {json.dumps(tool_args)}]:\n{result}")
+                evidence_pieces.append(f"[{mcp_tool} | {json.dumps(args_used)}]:\n{result}")
                 reasoning_trace.append(f"Evidence via {mcp_tool}: {result[:200]}")
                 ev_toks       = len(result) // 4
                 total_ev_toks = sum(len(p) // 4 for p in evidence_pieces)

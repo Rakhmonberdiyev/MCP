@@ -12,7 +12,11 @@ _redis: aioredis.Redis | None = None
 # TTLs
 _HISTORY_TTL = 30 * 86400   # 30 days — individual session history
 _META_TTL    = 90 * 86400   # 90 days — sessions list + current pointer
+_SUMMARY_TTL = 30 * 86400   # 30 days — rolling session summary
 MAX_SESSIONS = 20            # max sessions kept per user
+
+# Summarized buffer config
+ACTIVE_TURNS = 5             # last N turns always sent in full to LLM
 
 # Docs
 _DOCS_TTL = 30 * 86400
@@ -149,6 +153,41 @@ async def clear_session(user_id: str) -> None:
             s["message_count"] = 0
             break
     await r.setex(f"sessions:{user_id}", _META_TTL, json.dumps(sessions))
+
+
+# ── Summarized buffer (active window + rolling summary) ───────────────────────
+
+async def get_active_buffer(user_id: str) -> list[dict]:
+    """Return the most recent ACTIVE_TURNS turns (2×ACTIVE_TURNS messages) in full."""
+    sid  = await get_current_session_id(user_id)
+    r    = await _get_redis()
+    data = await r.get(f"history:{user_id}:{sid}")
+    history = json.loads(data) if data else []
+    return history[-(ACTIVE_TURNS * 2):]
+
+
+async def get_older_history(user_id: str) -> list[dict]:
+    """Return messages older than the active buffer (used for summary generation)."""
+    sid  = await get_current_session_id(user_id)
+    r    = await _get_redis()
+    data = await r.get(f"history:{user_id}:{sid}")
+    history = json.loads(data) if data else []
+    cutoff = len(history) - ACTIVE_TURNS * 2
+    return history[:cutoff] if cutoff > 0 else []
+
+
+async def get_session_summary(user_id: str) -> str:
+    """Return the saved rolling summary of older turns, or empty string."""
+    sid  = await get_current_session_id(user_id)
+    r    = await _get_redis()
+    return (await r.get(f"summary:{user_id}:{sid}")) or ""
+
+
+async def save_session_summary(user_id: str, summary: str) -> None:
+    """Persist (overwrite) the rolling summary for the active session."""
+    sid = await get_current_session_id(user_id)
+    r   = await _get_redis()
+    await r.setex(f"summary:{user_id}:{sid}", _SUMMARY_TTL, summary)
 
 
 # ── Per-user uploaded document tracking (unchanged) ───────────────────────────

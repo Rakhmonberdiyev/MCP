@@ -7,7 +7,7 @@ from qdrant_client.models import Distance, VectorParams
 
 load_dotenv()
 
-# --- LLM (Xazna) ---
+
 LLM_BASE_URL = "https://ai.xazna.uz/llm/v1"
 LLM_API_KEY = "sk-raximberdi-cmF4aW1iZXJkaQ"
 
@@ -46,10 +46,7 @@ MEM0_CONFIG = {
         "config": {
             "model":            "/models/embedding",
             "api_key":          LLM_API_KEY,
-            "openai_base_url":  LLM_BASE_URL,
-            # Do NOT set embedding_dims here — Xazna does not support the
-            # OpenAI matryoshka `dimensions` parameter and will return 400.
-            # The 2048 dim is declared in vector_store.embedding_model_dims below.
+            "openai_base_url":  LLM_BASE_URL
         },
     },
     "vector_store": {
@@ -120,7 +117,7 @@ REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
 SESSION_TTL = 86400          # 24 hours (seconds)
 MAX_SESSION_MESSAGES = 40    # rolling window
 
-# --- Qdrant RAG ---
+
 QDRANT_HOST = "localhost"
 QDRANT_PORT = 6333
 RAG_COLLECTION = "knowledge_base"
