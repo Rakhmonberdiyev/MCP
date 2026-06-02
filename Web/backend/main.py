@@ -17,9 +17,10 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../.
 
 import asyncio
 import json
+from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -34,7 +35,19 @@ from memory.session import (
     get_session_history,
 )
 
-app = FastAPI(title="AI Agent Dashboard API", version="1.0.0")
+
+def _service_unavailable(exc: Exception) -> HTTPException:
+    """Convert an infrastructure error (Redis, Qdrant, etc.) to a clean 503."""
+    return HTTPException(status_code=503, detail=f"Service unavailable: {exc}")
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    await initialize()
+    yield
+
+
+app = FastAPI(title="AI Agent Dashboard API", version="1.0.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -43,41 +56,43 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-_initialized = False
-
-
-@app.on_event("startup")
-async def _startup() -> None:
-    global _initialized
-    if not _initialized:
-        await initialize()
-        _initialized = True
-
 
 # ── Session endpoints ──────────────────────────────────────────────────────────
 
 @app.get("/api/sessions")
 async def list_sessions(user_id: str):
-    sessions = await get_sessions_list(user_id)
-    current  = await get_current_session_id(user_id)
-    return {"sessions": sessions, "current_session_id": current}
+    try:
+        current  = await get_current_session_id(user_id)  # creates session if user has none
+        sessions = await get_sessions_list(user_id)        # now includes the just-created session
+        return {"sessions": sessions, "current_session_id": current}
+    except Exception as exc:
+        raise _service_unavailable(exc)
 
 
 @app.get("/api/sessions/{session_id}/history")
 async def get_history(session_id: str, user_id: str):
-    history = await get_session_history(user_id, session_id)
-    return {"session_id": session_id, "history": history}
+    try:
+        history = await get_session_history(user_id, session_id)
+        return {"session_id": session_id, "history": history}
+    except Exception as exc:
+        raise _service_unavailable(exc)
 
 
 @app.post("/api/sessions")
-async def new_session(user_id: str):
-    sid = await create_session(user_id)
-    return {"session_id": sid}
+async def new_session(user_id: str = Query(...)):
+    try:
+        sid = await create_session(user_id)
+        return {"session_id": sid}
+    except Exception as exc:
+        raise _service_unavailable(exc)
 
 
 @app.post("/api/sessions/{session_id}/switch")
-async def switch(session_id: str, user_id: str):
-    ok = await switch_session(user_id, session_id)
+async def switch(session_id: str, user_id: str = Query(...)):
+    try:
+        ok = await switch_session(user_id, session_id)
+    except Exception as exc:
+        raise _service_unavailable(exc)
     if not ok:
         raise HTTPException(status_code=404, detail="Session not found")
     return {"ok": True}
@@ -102,8 +117,11 @@ async def chat_stream(req: ChatRequest):
                          "metadata": {...}}          — final full response + metadata
       {"type": "error",  "error": "..."}             — pipeline error
     """
-    if req.session_id:
-        await switch_session(req.user_id, req.session_id)
+    try:
+        if req.session_id:
+            await switch_session(req.user_id, req.session_id)
+    except Exception as exc:
+        raise _service_unavailable(exc)
 
     queue: asyncio.Queue = asyncio.Queue()
     metadata: dict = {}
@@ -113,6 +131,7 @@ async def chat_stream(req: ChatRequest):
         await queue.put({"type": "token", "content": chunk})
 
     async def _run() -> None:
+        # Set ContextVars inside the task so concurrent requests get isolated log streams
         ui.set_log_queue(queue)
         ui.set_tool_collector(tool_collector)
         try:
@@ -130,6 +149,8 @@ async def chat_stream(req: ChatRequest):
                 "tool_calls": tool_collector["tools"],
             }
             await queue.put({"type": "done", "response": response, "metadata": full_metadata})
+        except asyncio.CancelledError:
+            raise  # let the task cancellation propagate cleanly
         except Exception as exc:
             await queue.put({"type": "error", "error": str(exc)})
 
@@ -141,11 +162,13 @@ async def chat_stream(req: ChatRequest):
                 yield f"data: {json.dumps(item, ensure_ascii=False)}\n\n"
                 if item["type"] in ("done", "error"):
                     break
+        except GeneratorExit:
+            pass  # client disconnected — fall through to finally
         finally:
             task.cancel()
             try:
                 await task
-            except asyncio.CancelledError:
+            except (asyncio.CancelledError, Exception):
                 pass
 
     return StreamingResponse(

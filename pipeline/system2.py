@@ -205,18 +205,23 @@ async def _get_tool_schemas(mcp: FastMCP) -> list[dict]:
 
 async def _llm_stream_synthesis(
     model: str, messages: list, tools: list, on_chunk,
-) -> tuple[dict, None]:
+) -> tuple[dict, object]:
     """Streaming LLM call for synthesis. Invokes on_chunk for text tokens; silently
     accumulates tool calls. Falls back to non-streaming if streaming fails."""
     try:
         stream = await llm_client.chat.completions.create(
             model=model, messages=messages, tools=tools or None, stream=True,
+            stream_options={"include_usage": True},
         )
         content_parts: list[str] = []
         tool_calls_acc: dict[int, dict] = {}
         has_tool_calls = False
+        stream_usage = None
 
         async for chunk in stream:
+            # Final usage chunk arrives with empty choices
+            if getattr(chunk, 'usage', None):
+                stream_usage = chunk.usage
             if not chunk.choices:
                 continue
             delta = chunk.choices[0].delta
@@ -248,7 +253,7 @@ async def _llm_stream_synthesis(
             [tool_calls_acc[i] for i in sorted(tool_calls_acc)]
             if tool_calls_acc else None
         )
-        return {"role": "assistant", "content": content, "tool_calls": tool_calls}, None
+        return {"role": "assistant", "content": content, "tool_calls": tool_calls}, stream_usage
 
     except Exception:
         # Fall back to non-streaming

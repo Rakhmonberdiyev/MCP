@@ -27,22 +27,35 @@ export default function App() {
   const [sessions,   setSessions]   = useState([])
   const [currentSid, setCurrentSid] = useState(null)
   const [messages,   setMessages]   = useState([])
-  const [deepthink,  setDeepthink]  = useState(true)
+  const [deepthink,  setDeepthink]  = useState(false)
   const [streaming,  setStreaming]  = useState(false)
+  const [apiError,   setApiError]   = useState(null)
+  const [loading,    setLoading]    = useState(false)
 
   // Typewriter effect state — refs so setInterval can read current values without stale closure
-  const _typeQueue = useRef('')   // chars waiting to be typed
-  const _typeTimer = useRef(null) // active interval id
+  const _typeQueue = useRef('')
+  const _typeTimer = useRef(null)
+
+  useEffect(() => {
+    return () => {
+      if (_typeTimer.current) clearInterval(_typeTimer.current)
+    }
+  }, [])
 
   // ── Load sessions whenever userId changes ──────────────────────────────────
   const loadSessions = useCallback(async (uid) => {
     if (!uid) { setSessions([]); return }
+    setLoading(true)
     try {
-      const { sessions, current_session_id } = await fetchSessions(uid)
-      setSessions(sessions)
+      const { sessions: sessionList = [], current_session_id } = await fetchSessions(uid)
+      setSessions(sessionList)
+      setApiError(null)
       return current_session_id
     } catch (e) {
       console.error('fetchSessions failed:', e)
+      setApiError('Cannot reach server. Is the backend running on port 8000?')
+    } finally {
+      setLoading(false)
     }
   }, [])
 
@@ -58,8 +71,11 @@ export default function App() {
   useEffect(() => {
     if (!currentSid || !userId) { setMessages([]); return }
     fetchHistory(userId, currentSid)
-      .then(({ history }) => setMessages(toLocalMessages(history)))
-      .catch(e => console.error('fetchHistory failed:', e))
+      .then(({ history }) => { setMessages(toLocalMessages(history)); setApiError(null) })
+      .catch(e => {
+        console.error('fetchHistory failed:', e)
+        setApiError('Cannot reach server. Is the backend running on port 8000?')
+      })
   }, [currentSid, userId])
 
   // ── Session actions ────────────────────────────────────────────────────────
@@ -79,6 +95,7 @@ export default function App() {
       await loadSessions(userId)
     } catch (e) {
       console.error('createSession failed:', e)
+      setApiError('Failed to create session. Is the backend running?')
     }
   }, [userId, loadSessions])
 
@@ -86,10 +103,24 @@ export default function App() {
   const handleSend = useCallback(async (text) => {
     if (!text || !userId || streaming) return
 
+    // Auto-create session if none exists (e.g. backend was down on startup)
+    let activeSid = currentSid
+    if (!activeSid) {
+      try {
+        const { session_id } = await createSession(userId)
+        activeSid = session_id
+        setCurrentSid(session_id)
+        await loadSessions(userId)
+      } catch (e) {
+        console.error('Auto-create session failed:', e)
+        setApiError('No active session. Is the backend running?')
+        return
+      }
+    }
+
     const userMsgId = uid()
     const asstMsgId = uid()
 
-    // Reset typewriter state
     if (_typeTimer.current) { clearInterval(_typeTimer.current); _typeTimer.current = null }
     _typeQueue.current = ''
 
@@ -100,7 +131,7 @@ export default function App() {
     ])
     setStreaming(true)
 
-    // Typewriter interval: 1 char per tick normally; 3 chars when queue > 50 to catch up
+    // Typewriter: 1 char/tick normally, 3 chars/tick when queue > 50 (catch-up)
     _typeTimer.current = setInterval(() => {
       if (_typeQueue.current.length === 0) return
       const batch = _typeQueue.current.length > 50 ? 3 : 1
@@ -111,12 +142,11 @@ export default function App() {
       )
     }, 12)
 
-    await streamChat(userId, currentSid, text, deepthink, {
+    await streamChat(userId, activeSid, text, deepthink, {
       onToken: (chunk) => {
         _typeQueue.current += chunk
       },
       onDone: (response, metadata) => {
-        // Stop typing animation and show the complete final response immediately
         clearInterval(_typeTimer.current)
         _typeTimer.current = null
         _typeQueue.current = ''
@@ -137,7 +167,7 @@ export default function App() {
         setMessages(prev =>
           prev.map(m =>
             m.id === asstMsgId
-              ? { ...m, content: `⚠️ Error: ${err}`, streaming: false }
+              ? { ...m, content: `Error: ${err}`, streaming: false }
               : m,
           ),
         )
@@ -155,27 +185,36 @@ export default function App() {
     })
   }, [userId, currentSid, deepthink, streaming, loadSessions])
 
-  const currentSession = sessions.find(s => s.id === currentSid) ?? null
+  const currentSession = (sessions ?? []).find(s => s.id === currentSid) ?? null
 
   return (
-    <div className="flex h-screen overflow-hidden">
-      <Sidebar
-        userId={userId}
-        onUserIdChange={setUserId}
-        sessions={sessions}
-        currentSid={currentSid}
-        onSessionSwitch={handleSessionSwitch}
-        onNewSession={handleNewSession}
-      />
-      <ChatPanel
-        messages={messages}
-        isStreaming={streaming}
-        deepthink={deepthink}
-        onDeepthinkChange={setDeepthink}
-        onSend={handleSend}
-        currentSession={currentSession}
-        hasUserId={!!userId}
-      />
+    <div className="flex h-screen overflow-hidden flex-col">
+      {apiError && (
+        <div className="flex-shrink-0 bg-red-500 text-white text-sm px-4 py-2 flex items-center justify-between">
+          <span>⚠ {apiError}</span>
+          <button onClick={() => setApiError(null)} className="ml-4 font-bold hover:opacity-75">✕</button>
+        </div>
+      )}
+      <div className="flex flex-1 overflow-hidden">
+        <Sidebar
+          userId={userId}
+          onUserIdChange={setUserId}
+          sessions={sessions}
+          currentSid={currentSid}
+          onSessionSwitch={handleSessionSwitch}
+          onNewSession={handleNewSession}
+          loading={loading}
+        />
+        <ChatPanel
+          messages={messages}
+          isStreaming={streaming}
+          deepthink={deepthink}
+          onDeepthinkChange={setDeepthink}
+          onSend={handleSend}
+          currentSession={currentSession}
+          hasUserId={!!userId}
+        />
+      </div>
     </div>
   )
 }

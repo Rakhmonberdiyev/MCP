@@ -33,18 +33,23 @@ async def _llm_call(model: str, messages: list, tools: list) -> tuple[dict, obje
 
 async def _llm_call_stream(
     model: str, messages: list, tools: list, on_chunk,
-) -> tuple[dict, None]:
+) -> tuple[dict, object]:
     """Streaming LLM call. Calls on_chunk(str) for text tokens only (skips tool calls).
     Falls back to non-streaming and a single on_chunk call if streaming fails."""
     try:
         stream = await llm_client.chat.completions.create(
             model=model, messages=messages, tools=tools or None, stream=True,
+            stream_options={"include_usage": True},
         )
         content_parts: list[str] = []
         tool_calls_acc: dict[int, dict] = {}
         has_tool_calls = False
+        stream_usage = None
 
         async for chunk in stream:
+            # Final usage chunk arrives with empty choices
+            if getattr(chunk, 'usage', None):
+                stream_usage = chunk.usage
             if not chunk.choices:
                 continue
             delta = chunk.choices[0].delta
@@ -76,7 +81,7 @@ async def _llm_call_stream(
             [tool_calls_acc[i] for i in sorted(tool_calls_acc)]
             if tool_calls_acc else None
         )
-        return {"role": "assistant", "content": content, "tool_calls": tool_calls}, None
+        return {"role": "assistant", "content": content, "tool_calls": tool_calls}, stream_usage
 
     except Exception:
         # Streaming unsupported or failed — fall back to non-streaming

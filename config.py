@@ -21,14 +21,14 @@ MODEL_ID: str = ""
 
 # --- Mem0 (LTM): Qdrant vectors + Neo4j graph ---
 #
-# Two-layer memory architecture:
-#   mem0          (Qdrant)  — Active atomic facts, current state only.
-#                             Mem0 auto-deduplicates: update/delete old fact
-#                             when a new one conflicts. Always the latest "you".
-#   mem0_history  (SQLite)  — Change-log archive. Every ADD / UPDATE / DELETE
-#                             event is recorded here automatically by Mem0.
-#                             Used to answer "when did I change X?" queries.
-#                             Stored at mem0_history.db next to this file.
+# Memory architecture:
+#   Qdrant   (via Mem0)  — Active atomic facts, current state only.
+#                          Mem0 auto-deduplicates: updates/deletes old facts
+#                          when new conflicting facts arrive.
+#   PostgreSQL           — Multi-user event log (ADD / UPDATE / DELETE).
+#                          Written by upsert_ltm() after each ltm_memory.add().
+#                          Replaces the single-file mem0_history.db.
+#   Neo4j               — Relationship graph (entity triples).
 #
 # Both LLM and embedder use Xazna — no OpenAI dependency.
 #
@@ -46,45 +46,102 @@ MEM0_CONFIG = {
         "config": {
             "model":            "/models/embedding",
             "api_key":          LLM_API_KEY,
-            "openai_base_url":  LLM_BASE_URL
+            "openai_base_url":  LLM_BASE_URL,
         },
     },
     "vector_store": {
         "provider": "qdrant",
         "config": {
-            "host": "localhost",
-            "port": 6333,
-            "collection_name": "mem0", 
-            "embedding_model_dims": 2048,         # Active facts — current state
+            "host":                   "localhost",
+            "port":                   6333,
+            "collection_name":        "mem0",
+            "embedding_model_dims":   2048,
         },
     },
     "graph_store": {
         "provider": "neo4j",
         "config": {
-            "url": "bolt://localhost:7687",
+            "url":      "bolt://localhost:7687",
             "username": "neo4j",
             "password": os.getenv("NEO4J_PASSWORD", "password123"),
         },
     },
-    "history_db_path": os.path.join(os.path.dirname(__file__), "mem0_history.db"),
-    "custom_prompt": """\
-Extract ONLY meaningful semantic facts from the conversation — things worth remembering long-term.
+    "history_store": {
+        "provider": "postgresql",
+        "config": {
+            "url": os.getenv(
+                "DATABASE_URL",
+                "postgresql://mem0:mem0pass@localhost:5432/mem0_history",
+            ),
+        },
+    },
+    # ── Fact extraction ────────────────────────────────────────────────────────
+    # Replaces USER_MEMORY_EXTRACTION_PROMPT which (a) ignores assistant messages
+    # and (b) discards old values on UPDATE.  Both gaps break temporal queries.
+    "custom_fact_extraction_prompt": """\
+You are a banking-domain memory extractor.
+Extract meaningful long-term facts from the FULL conversation — both user AND assistant turns.
+Assistant confirmations frequently contain names, values, and transitions that are essential to remember.
+
+OUTPUT FORMAT — return ONLY this JSON, nothing else:
+{"facts": ["fact 1", "fact 2", ...]}
+
+VALUE TRANSITIONS (critical rule):
+When any value CHANGES — a credit limit, card type, co-holder, address — ALWAYS include
+BOTH the old AND new value in the extracted fact.
+  Pattern: "[attribute] [old value] dan [new value] ga o'zgartirildi"
+  English: "[attribute] changed from [old] to [new]"
+Examples:
+  "Kredit limiti 10,000,000 dan 7,000,000 UZS ga kamaytirildi"
+  "Humo Classic arizasi bekor qilindi, o'rniga Visa Gold ochildi"
+  "Hammuallif Nilufar Visa Gold kartasiga qo'shildi, keyin olib tashlandi"
+This is mandatory — the only way to answer "what was X before?" later.
 
 INCLUDE:
-- Personal facts: name, age, job, location, nationality
-- Preferences: likes, dislikes, favorite things
-- Goals, plans, projects the user is working on
-- Skills and expertise the user has
-- People, places, and organizations the user mentions
-- Facts the user explicitly states about themselves or others
+- Card type (current and transitions), application status
+- Credit limits (always with old and new value when changed)
+- Co-holders / co-applicants: full name, added/removed events
+- Income, billing address, contact preferences
+- Service flags: SMS, autopay, foreign-currency, statement language
+- Explicit assistant confirmations (approvals, changes, cancellations)
 
-EXCLUDE (do NOT extract these as entities or facts):
-- Grammatical words: pronouns (men, siz, I, you), greetings (salom, hello), conjunctions, verbs
-- Generic question words or filler words
-- Temporary conversational context (e.g. "what's the weather today")
-- Facts about the world in general (China history, Tesla specs) — only personal facts
+EXCLUDE:
+- Greetings, filler phrases, day markers ("1-kun:", "Day 3:")
+- General world facts not about this user
+- Temporary questions without confirmed answers
 
-Always output the user's language (Uzbek, English, Russian, etc.) back as-is.
+Preserve the user's language (Uzbek, English, Russian) in every extracted fact.
+""",
+    # ── Update-memory prompt ───────────────────────────────────────────────────
+    # When a numeric/entity value changes, store the transition text, not just
+    # the new value, so historical queries can still be answered from Qdrant.
+    "custom_update_memory_prompt": """\
+You are a smart memory manager. Perform one of: ADD, UPDATE, DELETE, or NONE.
+
+Compare each new retrieved fact against existing memories:
+- ADD    : fact is genuinely new, no existing memory covers it
+- UPDATE : fact conflicts with or refines an existing memory — keep the SAME ID
+- DELETE : fact explicitly removes a previously stored entity
+- NONE   : fact is already captured by an existing memory
+
+TRANSITION RULE (mandatory):
+When UPDATing a memory that holds a specific value (amount, card name, co-holder name,
+address) and the new fact describes a change FROM the old value TO a new one, store the
+FULL TRANSITION in the updated text. Never discard the old value.
+  WRONG:   "Kredit limiti 7,000,000 UZS"
+  CORRECT: "Kredit limiti 10,000,000 dan 7,000,000 UZS ga kamaytirildi"
+
+Return ONLY this JSON:
+{
+  "memory": [
+    {
+      "id": "<existing or new ID>",
+      "text": "<memory text>",
+      "event": "ADD|UPDATE|DELETE|NONE",
+      "old_memory": "<old text — required if event is UPDATE>"
+    }
+  ]
+}
 """,
 }
 

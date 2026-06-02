@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useState, useEffect } from 'react'
 
 function SessionItem({ session, isActive, onClick }) {
   return (
@@ -35,8 +35,14 @@ export default function Sidebar({
   currentSid,
   onSessionSwitch,
   onNewSession,
+  loading,
 }) {
   const [draft, setDraft] = useState(userId)
+
+  // Keep draft in sync when userId changes (e.g. loaded from localStorage)
+  useEffect(() => {
+    setDraft(userId)
+  }, [userId])
 
   function handleSubmit(e) {
     e.preventDefault()
@@ -87,12 +93,17 @@ export default function Sidebar({
             Enter a user ID to see sessions
           </p>
         )}
-        {userId && sessions.length === 0 && (
+        {userId && loading && (
+          <p className="text-slate-500 text-xs text-center mt-6 px-2 animate-pulse">
+            Loading sessions…
+          </p>
+        )}
+        {userId && !loading && sessions.length === 0 && (
           <p className="text-slate-500 text-xs text-center mt-6 px-2">
             No sessions found
           </p>
         )}
-        {sessions.map(s => (
+        {!loading && sessions.map(s => (
           <SessionItem
             key={s.id}
             session={s}
@@ -106,7 +117,7 @@ export default function Sidebar({
       <div className="px-3 pb-4 pt-2 border-t border-slate-700">
         <button
           onClick={onNewSession}
-          disabled={!userId}
+          disabled={!userId || loading}
           className="w-full py-2.5 rounded-lg text-sm font-medium transition-colors
                      bg-slate-700 text-slate-200 hover:bg-slate-600
                      disabled:opacity-30 disabled:cursor-not-allowed"

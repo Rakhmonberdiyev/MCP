@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(curl -sv \"http://localhost:8000/api/sessions?user_id=703460630\")",
+      "Bash(ps -p 57366 -o pid,command)",
+      "Bash(curl -s \"http://127.0.0.1:8000/api/sessions?user_id=703460630\")",
+      "Bash(nc -z 127.0.0.1 6379)",
+      "Bash(brew install *)"
+    ]
+  }
+}

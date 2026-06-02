@@ -17,6 +17,7 @@ MAX_SESSIONS = 20            # max sessions kept per user
 
 # Summarized buffer config
 ACTIVE_TURNS = 5             # last N turns always sent in full to LLM
+SUMMARY_OVERFLOW_TURNS = 4   # trigger summary when N new turns have overflowed active buffer
 
 # Docs
 _DOCS_TTL = 30 * 86400
@@ -29,6 +30,19 @@ async def _get_redis() -> aioredis.Redis:
         _redis = await aioredis.from_url(
             f"redis://{REDIS_HOST}:{REDIS_PORT}",
             decode_responses=True,
+            socket_connect_timeout=3,
+            socket_timeout=3,
+        )
+    try:
+        await _redis.ping()
+    except Exception:
+        # Connection is broken (Docker restarted, etc.) — reset and reconnect
+        _redis = None
+        _redis = await aioredis.from_url(
+            f"redis://{REDIS_HOST}:{REDIS_PORT}",
+            decode_responses=True,
+            socket_connect_timeout=3,
+            socket_timeout=3,
         )
     return _redis
 
@@ -188,6 +202,21 @@ async def save_session_summary(user_id: str, summary: str) -> None:
     sid = await get_current_session_id(user_id)
     r   = await _get_redis()
     await r.setex(f"summary:{user_id}:{sid}", _SUMMARY_TTL, summary)
+
+
+async def get_summary_cursor(user_id: str) -> int:
+    """Return the number of older turns already incorporated into the summary (0 if none)."""
+    sid = await get_current_session_id(user_id)
+    r   = await _get_redis()
+    val = await r.get(f"summary_cursor:{user_id}:{sid}")
+    return int(val) if val else 0
+
+
+async def save_summary_cursor(user_id: str, turn_count: int) -> None:
+    """Record how many older turns have been summarized so far."""
+    sid = await get_current_session_id(user_id)
+    r   = await _get_redis()
+    await r.setex(f"summary_cursor:{user_id}:{sid}", _SUMMARY_TTL, str(turn_count))
 
 
 # ── Per-user uploaded document tracking (unchanged) ───────────────────────────

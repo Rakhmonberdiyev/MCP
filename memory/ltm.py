@@ -2,9 +2,26 @@
 
 import asyncio
 import time
-from config import ltm_memory, MEM0_CONFIG
+import config
+from config import MEM0_CONFIG
 import ui
 
+
+def _get_ltm():
+    """Return the live ltm_memory, attempting lazy init if it was None at startup.
+
+    config.ltm_memory is None when Qdrant was down at import time. This function
+    retries the initialization on every call until it succeeds, so the web backend
+    recovers automatically once Qdrant comes up — no restart required.
+    """
+    if config.ltm_memory is None:
+        try:
+            from mem0 import Memory
+            config.ltm_memory = Memory.from_config(MEM0_CONFIG)
+            ui.ok("Mem0 LTM initialized (lazy — Qdrant is now reachable)")
+        except Exception as exc:
+            pass  # still unavailable — caller will skip gracefully
+    return config.ltm_memory
 
 # ── Dynamic top-K ──────────────────────────────────────────────────────────────
 
@@ -70,6 +87,8 @@ def deduplicate_ltm_facts(ltm_facts: str, recent_messages: list[dict]) -> str:
 _QDRANT_COLLECTION = MEM0_CONFIG["vector_store"]["config"]["collection_name"]
 
 
+_LTM_TIMEOUT = 8.0   # seconds — give up on Mem0 search if it hangs
+
 def _patch_sub_stores() -> tuple[dict, dict, callable]:
     """
     Temporarily monkey-patch Qdrant vector_store.search and Neo4j graph.search
@@ -82,7 +101,8 @@ def _patch_sub_stores() -> tuple[dict, dict, callable]:
     raw:     dict[str, object] = {}
     originals: list[tuple] = []   # (obj, attr, original_fn)
 
-    vs = getattr(ltm_memory, "vector_store", None) if ltm_memory else None
+    mem = _get_ltm()
+    vs = getattr(mem, "vector_store", None) if mem else None
     if vs and hasattr(vs, "search"):
         orig_vs = vs.search
         originals.append((vs, "search", orig_vs))
@@ -94,7 +114,7 @@ def _patch_sub_stores() -> tuple[dict, dict, callable]:
             return r
         vs.search = _vs_search
 
-    gs = getattr(ltm_memory, "graph", None) if ltm_memory else None
+    gs = getattr(mem, "graph", None) if mem else None
     if gs and hasattr(gs, "search"):
         orig_gs = gs.search
         originals.append((gs, "search", orig_gs))
@@ -113,13 +133,14 @@ def _patch_sub_stores() -> tuple[dict, dict, callable]:
     return timings, raw, restore
 
 
-async def search_ltm(query: str, user_id: str, limit: int = 4) -> str:
+async def search_ltm(query: str, user_id: str, limit: int = 4, min_score: float = 0.5) -> str:
     """Return relevant facts as a newline-separated string, or empty string."""
     if limit == 0:
         ui.kv("Mem0 LTM", "skipped (greeting / low-complexity query)")
         return ""
-    if ltm_memory is None:
-        ui.warn("Mem0 LTM not initialized (Qdrant was down at startup) — skipping LTM search")
+    mem = _get_ltm()
+    if mem is None:
+        ui.warn("Mem0 LTM not initialized (Qdrant unreachable) — skipping LTM search")
         return ""
 
     ui.console.print()
@@ -136,9 +157,15 @@ async def search_ltm(query: str, user_id: str, limit: int = 4) -> str:
 
     t0 = time.perf_counter()
     try:
-        results = await asyncio.to_thread(
-            ltm_memory.search, query, user_id=user_id, limit=limit
+        results = await asyncio.wait_for(
+            asyncio.to_thread(mem.search, query, user_id=user_id, limit=limit),
+            timeout=_LTM_TIMEOUT,
         )
+    except asyncio.TimeoutError:
+        restore()
+        ui.warn(f"Mem0 search timed out (>{_LTM_TIMEOUT:.0f}s) — skipping LTM")
+        ui.kv("LTM injected ≈", "0 tok — timeout")
+        return ""
     except Exception as exc:
         restore()
         ui.warn(f"Mem0 search failed (non-fatal): {exc}")
@@ -154,7 +181,7 @@ async def search_ltm(query: str, user_id: str, limit: int = 4) -> str:
         ui.timing("Neo4j graph search",   timings["neo4j"])
     ui.timing("Mem0 total",               elapsed)
 
-    _MIN_SCORE = 0.5   # discard vector hits below this cosine similarity
+    _MIN_SCORE = min_score   # discard vector hits below this cosine similarity
 
     # Memory.search() returns {"results": [...vector...], "relations": [...graph...]}
     vector_raw  = (results or {}).get("results",   [])
@@ -229,7 +256,17 @@ async def search_ltm(query: str, user_id: str, limit: int = 4) -> str:
 
 async def upsert_ltm(user_input: str, assistant_output: str, user_id: str) -> None:
     """Extract and upsert facts from a conversation turn (runs in background)."""
-    if ltm_memory is None:
+    mem = _get_ltm()
+    if mem is None:
         return
-    text = f"User: {user_input}\nAssistant: {assistant_output}"
-    await asyncio.to_thread(ltm_memory.add, text, user_id=user_id)
+    messages = [
+        {"role": "user",      "content": user_input},
+        {"role": "assistant", "content": assistant_output},
+    ]
+    result = await asyncio.to_thread(mem.add, messages, user_id=user_id)
+
+    # Persist ADD / UPDATE / DELETE events to PostgreSQL (non-fatal if DB is down)
+    events = (result or {}).get("results", [])
+    if events:
+        from memory.db import write_events
+        await write_events(user_id, events)

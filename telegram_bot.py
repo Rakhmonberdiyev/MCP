@@ -189,7 +189,7 @@ router = Router()
 @router.message(CommandStart())
 async def cmd_start(message: Message) -> None:
     uid = message.from_user.id
-    _set_deepthink(uid, True)
+    _set_deepthink(uid, False)
     name = message.from_user.first_name or "there"
     await message.answer(
         f"👋 Hi <b>{name}</b>! I'm your AI Assistant.\n\n"

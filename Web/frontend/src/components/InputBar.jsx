@@ -21,9 +21,8 @@ export default function InputBar({ onSend, disabled, isStreaming }) {
     }
   }
 
-  function handleInput(e) {
+  function handleChange(e) {
     setText(e.target.value)
-    // Auto-grow textarea up to ~160 px
     e.target.style.height = 'auto'
     e.target.style.height = Math.min(e.target.scrollHeight, 160) + 'px'
   }
@@ -34,8 +33,7 @@ export default function InputBar({ onSend, disabled, isStreaming }) {
         <textarea
           ref={textareaRef}
           value={text}
-          onInput={handleInput}
-          onChange={e => setText(e.target.value)}
+          onChange={handleChange}
           onKeyDown={handleKeyDown}
           disabled={disabled}
           placeholder={

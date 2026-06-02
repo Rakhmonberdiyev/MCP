@@ -52,7 +52,7 @@ def check_output(text: str) -> tuple[bool, str]:
 
 
 def redact_unsafe_output(text: str) -> str:
-    """Replace an unsafe response with a safe fallback message."""
+    """Replace an  unsafe response with a safe fallback message."""
     return (
         "I'm sorry, I can't provide that response. "
         "Please ask me something else."

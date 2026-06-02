@@ -51,6 +51,7 @@ export async function streamChat(userId, sessionId, message, deepthink, { onToke
     const reader = response.body.getReader()
     const decoder = new TextDecoder()
     let buffer = ''
+    let completed = false
 
     while (true) {
       const { done, value } = await reader.read()
@@ -67,14 +68,17 @@ export async function streamChat(userId, sessionId, message, deepthink, { onToke
         try {
           const data = JSON.parse(dataLine.slice(6))
           if (data.type === 'token') onToken(data.content)
-          else if (data.type === 'done') onDone(data.response, data.metadata)
-          else if (data.type === 'error') onError(data.error)
+          else if (data.type === 'done') { completed = true; onDone(data.response, data.metadata) }
+          else if (data.type === 'error') { completed = true; onError(data.error) }
           else if (data.type === 'log' && onLog) onLog(data)
         } catch {
           // ignore malformed events
         }
       }
     }
+
+    // Stream ended without a done/error event — connection was dropped
+    if (!completed) onError('Connection closed unexpectedly. Please try again.')
   } catch (err) {
     onError(err.message)
   }

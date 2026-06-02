@@ -36,11 +36,35 @@ import config
 from fastmcp import FastMCP
 
 import ui
+
+# ── Gemma tokenizer (lazy-loaded once) ────────────────────────────────────────
+_GEMMA_TOKENIZER_NAME = "unsloth/gemma-2b"  # public mirror of google/gemma-2b tokenizer
+_NOT_LOADED = object()          # sentinel: distinguishes "not tried" from None (failed)
+_gemma_tokenizer = _NOT_LOADED
+
+def _load_tokenizer():
+    global _gemma_tokenizer
+    if _gemma_tokenizer is not _NOT_LOADED:
+        return _gemma_tokenizer  # None = already failed; tokenizer object = ready
+    try:
+        from transformers import AutoTokenizer  # type: ignore[import]
+        _gemma_tokenizer = AutoTokenizer.from_pretrained(_GEMMA_TOKENIZER_NAME)
+    except Exception as exc:
+        ui.warn(f"Gemma tokenizer unavailable ({exc}) — falling back to chars÷4")
+        _gemma_tokenizer = None
+    return _gemma_tokenizer
+
+def _count_tokens(text: str) -> int:
+    tok = _load_tokenizer()
+    if tok is not None:
+        return len(tok.encode(text, add_special_tokens=False))
+    return max(0, len(text) // 4)
 from memory.session import (
     get_active_buffer, get_older_history,
     get_session_summary, save_session_summary,
-    get_current_session_meta,
+    get_summary_cursor, save_summary_cursor,
     save_turn, get_user_docs,
+    SUMMARY_OVERFLOW_TURNS,
 )
 from memory.ltm import search_ltm, upsert_ltm, query_ltm_limit, deduplicate_ltm_facts
 from tools.mcp_server import search_mcp, rag_mcp
@@ -101,7 +125,7 @@ async def initialize() -> str:
     config.MODEL_ID = model_id
     ui.console.print(
         f"\n[dim]Model:[/dim] [bold cyan]{model_id}[/bold cyan]"
-        f"  [dim]│[/dim]  [bold green]Deepthink ON[/bold green] by default\n"
+        f"  [dim]│[/dim]  [bold green]Deepthink OFF[/bold green] by default\n"
     )
     return model_id
 
@@ -111,7 +135,7 @@ async def initialize() -> str:
 async def process_turn(
     user_input: str,
     user_id: str,
-    deepthink: bool = True,
+    deepthink: bool = False,
     stream_callback=None,
     metadata: dict | None = None,
 ) -> str:
@@ -175,15 +199,12 @@ async def process_turn(
     )
     ui.kv("Context window", f"{len(messages)} messages sent to LLM")
 
-    # ── Token source breakdown (approximate: chars ÷ 4) ────────────────────────
-    def _est(text: str) -> int:
-        return max(0, len(text) // 4)
-
-    sys_total_toks   = _est(messages[0]["content"])
-    ltm_toks         = _est(ltm_facts) if ltm_facts else 0
-    summary_toks     = _est(session_summary) if session_summary else 0
-    buffer_toks      = sum(_est(str(m.get("content", ""))) for m in active_buffer)
-    user_toks        = _est(user_input)
+    # ── Token source breakdown (Gemma tokenizer) ───────────────────────────────
+    sys_total_toks   = _count_tokens(messages[0]["content"])
+    ltm_toks         = _count_tokens(ltm_facts) if ltm_facts else 0
+    summary_toks     = _count_tokens(session_summary) if session_summary else 0
+    buffer_toks      = sum(_count_tokens(str(m.get("content", ""))) for m in active_buffer)
+    user_toks        = _count_tokens(user_input)
     ui.token_sources({
         "System prompt":    max(0, sys_total_toks - ltm_toks - summary_toks),
         "Session summary":  summary_toks,
@@ -232,7 +253,7 @@ async def process_turn(
     response = await ground_and_filter(response, evidence, model)
     ui.timing("Grounding filter", time.perf_counter() - t_ground)
     ui.ok("Grounding complete")
-    ui.kv("🪙 Response tokens", f"≈{len(response)//4:,} tok  ({len(response):,} chars)")
+    ui.kv("🪙 Response tokens", f"{_count_tokens(response):,} tok  ({len(response):,} chars)")
 
     # ── 5. Output Safety Guard ──────────────────────────────────────────────────
     out_safe, out_reason = safety.check_output(response)
@@ -259,36 +280,64 @@ async def process_turn(
 
 
 async def _generate_summary(user_id: str, model: str) -> None:
-    """Summarize older turns and save to Redis. Runs in background every 5 turns."""
+    """
+    Incrementally update the rolling summary with NEW overflow turns only.
+
+    Flow:
+      1. Load existing summary + cursor (how many older turns were already summarized).
+      2. Find only the NEW turns that overflowed since the last summary run.
+      3. Ask LLM to merge them into the existing summary (one LLM call regardless of session length).
+      4. Save updated summary + advance the cursor.
+    """
     older = await get_older_history(user_id)
     if not older:
         return
-    # Format older history as plain text, truncating long assistant replies
+
+    cursor      = await get_summary_cursor(user_id)
+    new_turns   = older[cursor * 2:]          # messages not yet in summary
+    if not new_turns:
+        return
+
+    existing_summary = await get_session_summary(user_id)
+
     lines: list[str] = []
-    for m in older:
+    for m in new_turns:
         role    = "User" if m["role"] == "user" else "Assistant"
         content = (m.get("content") or "")[:300]
         lines.append(f"{role}: {content}")
-    text = "\n".join(lines)
+    new_text = "\n".join(lines)
+
+    if existing_summary:
+        system_msg = (
+            "You are updating a rolling conversation summary. "
+            "Merge the new turns into the existing summary. "
+            "Keep the result to 4–5 concise, factual sentences. No filler."
+        )
+        user_content = (
+            f"Existing summary:\n{existing_summary[:800]}\n\n"
+            f"New turns to incorporate:\n{new_text}"
+        )
+    else:
+        system_msg   = "Summarize this conversation in 2–3 concise sentences. Be factual. No filler."
+        user_content = new_text
+
     try:
         resp = await config.llm_client.chat.completions.create(
             model=model,
             messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "Summarize this conversation excerpt in 2–3 concise sentences. "
-                        "Focus on what the user asked and what the assistant found or answered. "
-                        "Be factual. No filler phrases."
-                    ),
-                },
-                {"role": "user", "content": text},
+                {"role": "system", "content": system_msg},
+                {"role": "user",   "content": user_content},
             ],
         )
         summary = (resp.choices[0].message.content or "").strip()
         if summary:
+            new_cursor = len(older) // 2      # all older turns are now summarized
             await save_session_summary(user_id, summary)
-            ui.console.print(f"[dim]  📝 Session summary updated ({len(summary)} chars)[/dim]")
+            await save_summary_cursor(user_id, new_cursor)
+            ui.console.print(
+                f"[dim]  📝 Summary updated  +{len(new_turns)//2} new turns  "
+                f"cursor={new_cursor}  ({len(summary)} chars)[/dim]"
+            )
     except Exception as e:
         ui.warn(f"Summary generation failed (non-fatal): {e}")
 
@@ -304,11 +353,13 @@ async def _persist(user_input: str, response: str, user_id: str, model: str) -> 
         ui.warn(f"Persist error: {e}")
         return
 
-    # Regenerate session summary every 5 turns once we have older history
+    # Trigger incremental summary when SUMMARY_OVERFLOW_TURNS new turns have
+    # overflowed the active buffer without being incorporated into the summary yet.
     try:
-        meta = await get_current_session_meta(user_id)
-        turn_count = (meta or {}).get("message_count", 0)
-        if turn_count >= 5 and turn_count % 5 == 0:
+        older  = await get_older_history(user_id)
+        cursor = await get_summary_cursor(user_id)
+        unsummarized_turns = len(older) // 2 - cursor
+        if unsummarized_turns >= SUMMARY_OVERFLOW_TURNS:
             await _generate_summary(user_id, model)
     except Exception as e:
         ui.warn(f"Summary trigger failed (non-fatal): {e}")
