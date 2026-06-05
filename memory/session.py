@@ -30,19 +30,6 @@ async def _get_redis() -> aioredis.Redis:
         _redis = await aioredis.from_url(
             f"redis://{REDIS_HOST}:{REDIS_PORT}",
             decode_responses=True,
-            socket_connect_timeout=3,
-            socket_timeout=3,
-        )
-    try:
-        await _redis.ping()
-    except Exception:
-        # Connection is broken (Docker restarted, etc.) — reset and reconnect
-        _redis = None
-        _redis = await aioredis.from_url(
-            f"redis://{REDIS_HOST}:{REDIS_PORT}",
-            decode_responses=True,
-            socket_connect_timeout=3,
-            socket_timeout=3,
         )
     return _redis
 
